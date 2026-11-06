@@ -1,0 +1,4 @@
+# Replace with your GitHub team(s). Changes to the workflow, scripts and health config need their review.
+/.github/   @comcast-BPOM/bpom-platform-admins
+/scripts/   @comcast-BPOM/bpom-platform-admins
+/config/    @comcast-BPOM/bpom-platform-admins

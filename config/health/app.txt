@@ -1,0 +1,5 @@
+# <path> <comma separated HTTP codes that count as healthy>   (curl runs ON the server)
+# Verified from the local setup guide for the APP role. VALIDATE on dev before first real use.
+/comcast-drom-gui/                                          200
+/donriver/core/non-sensitive-ui-config/system-descriptor    200
+/donriver/core/session/is/alive                             200,401

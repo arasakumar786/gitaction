@@ -1,0 +1,2 @@
+# PLACEHOLDER - confirm the real discovery endpoint and port on dev.
+/disc/        200,401,403

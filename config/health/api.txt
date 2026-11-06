@@ -1,0 +1,4 @@
+# PLACEHOLDER - confirm real endpoints on dev, then tighten the expected codes.
+# 401/403 prove the context is deployed and answering; 404 or 5xx mean it is not healthy.
+/rest/        200,401,403
+/CMDB/        200,401,403

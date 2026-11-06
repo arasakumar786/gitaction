@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: comcast-ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: |
+          set -euo pipefail
+          for f in scripts/run-rollout.sh scripts/lib/ssh.sh tests/orchestration-test.sh; do bash -n "$f"; done
+          for s in preflight backup prepare switch rollback health; do
+            cat scripts/remote/common.sh "scripts/remote/${s}.sh" | bash -n
+          done
+
+      - name: Orchestration tests (stubbed SSH)
+        run: bash tests/orchestration-test.sh
+
+      - name: Workflow YAML parses
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY'
+          import yaml
+          for f in (".github/workflows/tomcat-upgrade.yml", ".github/actions/autobahn-ssh/action.yml"):
+              yaml.safe_load(open(f, encoding="utf-8"))
+              print("OK", f)
+          PY

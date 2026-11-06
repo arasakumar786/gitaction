@@ -1,0 +1,275 @@
+name: Tomcat Upgrade
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Upgrades the Apache Tomcat 10.1.x binary on BPOM servers.
+# Application WARs are NOT deployed here - keep using bpom-deploy.yml for that.
+#
+# Flow:  validate -> fetch-tomcat (download + checksum + PGP) -> upgrade (per host)
+# Login: Vault JWT -> ssh-agent key -> Vault-signed cert -> Autobahn jump host
+#        -> target host -> sudo -u mradmin   (same as bpom-deploy.yml)
+#
+# Modes:
+#   dry_run   preflight only; nothing on the server is changed
+#   upgrade   backup -> prepare -> switch symlink -> start -> health (auto rollback optional)
+#   rollback  restore the previous version recorded by the last upgrade
+#
+# Host scope (rolling / canary):
+#   first      only the first host in the Vault list
+#   remaining  every host except the first
+#   all        every host, one at a time, stop at the first failure
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment (prod-ho = production DR)
+        required: true
+        type: choice
+        options: [dev, qa, qa2, staging, prod-ch, prod-ho]
+        default: dev
+      role:
+        description: Server role to upgrade
+        required: true
+        type: choice
+        options: [app, api, discovery, discovery_agent, syslog_listener, landingpage]
+        default: app
+      mode:
+        description: Operation
+        required: true
+        type: choice
+        options: [dry_run, upgrade, rollback]
+        default: dry_run
+      host_scope:
+        description: Which hosts of the role
+        required: true
+        type: choice
+        options: [first, remaining, all]
+        default: first
+      target_version:
+        description: Target Tomcat version, for example 10.1.57 (ignored for rollback)
+        required: false
+        type: string
+      source_version:
+        description: Expected current version (optional safety check)
+        required: false
+        type: string
+      expected_sha512:
+        description: Optional SHA-512 of the target tar.gz from the Apache download page
+        required: false
+        type: string
+      change_ticket:
+        description: Change ticket (required for staging, prod-ch, prod-ho)
+        required: false
+        type: string
+      auto_rollback:
+        description: Automatically roll back the host if the switch or health check fails
+        required: true
+        type: boolean
+        default: true
+      allow_force_kill:
+        description: Allow kill -9 if Tomcat will not stop gracefully
+        required: true
+        type: boolean
+        default: false
+      health_base_url:
+        description: Base URL checked on each server (curl is run on the server itself)
+        required: true
+        type: string
+        default: http://localhost:8080
+      health_timeout_seconds:
+        description: How long to wait for the applications to come up
+        required: true
+        type: string
+        default: '420'
+      download_base:
+        description: Tomcat download base (use an internal mirror if the runner has no internet)
+        required: true
+        type: string
+        default: https://archive.apache.org/dist/tomcat/tomcat-10
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  VAULT_ADDR: https://xsm-vault.sm.comcast.com
+  AUTOBAHN_JUMP_SERVER: jump.autobahn.comcast.com
+  BASE_DIR: /app/platform/tomcat
+  LINK_NAME: tomcat
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  validate:
+    name: Validate request
+    runs-on: comcast-ubuntu-latest
+    steps:
+      - name: Validate inputs
+        env:
+          MODE: ${{ inputs.mode }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          TARGET_VERSION: ${{ inputs.target_version }}
+          SOURCE_VERSION: ${{ inputs.source_version }}
+          CHANGE_TICKET: ${{ inputs.change_ticket }}
+          HOST_SCOPE: ${{ inputs.host_scope }}
+          HEALTH_TIMEOUT: ${{ inputs.health_timeout_seconds }}
+        run: |
+          set -euo pipefail
+          ver_re='^10\.1\.[0-9]+$'
+          if [[ "$MODE" != "rollback" ]]; then
+            [[ "$TARGET_VERSION" =~ $ver_re ]] || { echo "::error::target_version must look like 10.1.57"; exit 1; }
+          fi
+          if [[ -n "$SOURCE_VERSION" && ! "$SOURCE_VERSION" =~ $ver_re ]]; then
+            echo "::error::source_version must look like 10.1.55"; exit 1
+          fi
+          [[ "$HEALTH_TIMEOUT" =~ ^[0-9]+$ ]] || { echo "::error::health_timeout_seconds must be a number"; exit 1; }
+          case "$ENVIRONMENT" in
+            staging|prod-ch|prod-ho)
+              [[ -n "$CHANGE_TICKET" ]] || { echo "::error::change_ticket is required for $ENVIRONMENT"; exit 1; } ;;
+          esac
+          if [[ "$MODE" == "rollback" && "$HOST_SCOPE" == "all" && "$ENVIRONMENT" == prod-* ]]; then
+            echo "::warning::Rolling back ALL production hosts at once - make sure this is intended."
+          fi
+          echo "Request OK: env=$ENVIRONMENT role=${{ inputs.role }} mode=$MODE scope=$HOST_SCOPE target=${TARGET_VERSION:-n/a}"
+
+      - name: Fetch production access list from Vault
+        if: inputs.environment == 'prod-ch' || inputs.environment == 'prod-ho'
+        id: acl
+        uses: hashicorp/vault-action@v3
+        with:
+          method: jwt
+          path: jwt/ghactions
+          url: ${{ env.VAULT_ADDR }}
+          role: comcast-bpom_ghactions
+          exportEnv: false
+          secrets: |
+            kv2/data/comcast-bpom/github-actions/deploy/common PROD_ALLOWED_USERS | PROD_ALLOWED_USERS
+
+      - name: Check the dispatcher is allowed for production
+        if: inputs.environment == 'prod-ch' || inputs.environment == 'prod-ho'
+        env:
+          ALLOWED_USERS_RAW: ${{ steps.acl.outputs.PROD_ALLOWED_USERS }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          [[ -n "$ALLOWED_USERS_RAW" ]] || { echo "::error::PROD_ALLOWED_USERS is not configured in Vault"; exit 1; }
+          IFS=', ' read -ra ALLOWED <<< "$ALLOWED_USERS_RAW"
+          for u in "${ALLOWED[@]}"; do
+            [[ "${u//[[:space:]]/}" == "$ACTOR" ]] && { echo "$ACTOR is authorized."; exit 0; }
+          done
+          echo "::error::$ACTOR is not authorized for production Tomcat changes."; exit 1
+
+  # ───────────────────────────────────────────────────────────────────────────
+  fetch-tomcat:
+    name: Download and verify Tomcat ${{ inputs.target_version }}
+    runs-on: comcast-ubuntu-latest
+    needs: validate
+    if: inputs.mode != 'rollback'
+    steps:
+      - name: Download, checksum and PGP verify
+        env:
+          TARGET_VERSION: ${{ inputs.target_version }}
+          DOWNLOAD_BASE: ${{ inputs.download_base }}
+          EXPECTED_SHA512: ${{ inputs.expected_sha512 }}
+        run: |
+          set -euo pipefail
+          BASE="${DOWNLOAD_BASE%/}"
+          F="apache-tomcat-${TARGET_VERSION}.tar.gz"
+          mkdir -p dist && cd dist
+          curl -fsSLO "${BASE}/v${TARGET_VERSION}/bin/${F}"
+          curl -fsSLO "${BASE}/v${TARGET_VERSION}/bin/${F}.sha512"
+          curl -fsSLO "${BASE}/v${TARGET_VERSION}/bin/${F}.asc"
+          curl -fsSL -o KEYS "https://downloads.apache.org/tomcat/tomcat-10/KEYS"
+
+          echo "== SHA-512 against the .sha512 published next to the archive =="
+          sha512sum -c "${F}.sha512"
+
+          if [[ -n "$EXPECTED_SHA512" ]]; then
+            actual=$(sha512sum "$F" | awk '{print tolower($1)}')
+            [[ "$actual" == "${EXPECTED_SHA512,,}" ]] \
+              || { echo "::error::SHA-512 does not match the expected_sha512 input"; exit 1; }
+            echo "SHA-512 matches the expected_sha512 input."
+          else
+            echo "::warning::expected_sha512 not supplied - relying on the checksum and signature published with the archive."
+          fi
+
+          echo "== PGP signature =="
+          export GNUPGHOME="$(mktemp -d)"
+          gpg --batch --quiet --import KEYS
+          gpg --batch --verify "${F}.asc" "${F}"
+          rm -f KEYS "${F}.asc"
+          ls -l
+
+      - name: Upload verified archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: tomcat-archive
+          path: dist/apache-tomcat-*.tar.gz*
+          retention-days: 3
+          if-no-files-found: error
+
+  # ───────────────────────────────────────────────────────────────────────────
+  upgrade:
+    name: ${{ inputs.mode }} ${{ inputs.role }} (${{ inputs.environment }}, ${{ inputs.host_scope }})
+    runs-on: comcast-ubuntu-latest
+    needs: [validate, fetch-tomcat]
+    if: ${{ !cancelled() && needs.validate.result == 'success' && (needs.fetch-tomcat.result == 'success' || inputs.mode == 'rollback') }}
+    environment: ${{ inputs.environment }}      # GitHub environment reviewers approve here
+    concurrency:
+      group: tomcat-upgrade-${{ inputs.environment }}-${{ inputs.role }}
+      cancel-in-progress: false
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Server login (Vault -> ssh-agent -> certificate)
+        uses: ./.github/actions/autobahn-ssh
+        with:
+          environment: ${{ inputs.environment }}
+          host-key: ${{ fromJSON('{"app":"APP_SSH_HOST","api":"API_SSH_HOST","discovery":"DISCOVERY_SSH_HOST","discovery_agent":"DISCOVERY_AGENT_SSH_HOST","syslog_listener":"SYSLOG_LISTENER_SSH_HOST","landingpage":"LANDINGPAGE_SSH_HOST"}')[inputs.role] }}
+
+      - name: Resolve target hosts
+        env:
+          HOST_SCOPE: ${{ inputs.host_scope }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra RAW <<< "$BPOMVAULT_SSH_HOST"
+          ALL=()
+          for h in "${RAW[@]}"; do h="$(echo "$h" | xargs)"; [[ -n "$h" ]] && ALL+=("$h"); done
+          [[ ${#ALL[@]} -gt 0 ]] || { echo "::error::No hosts found in Vault for this role/environment"; exit 1; }
+          case "$HOST_SCOPE" in
+            first)     SEL=("${ALL[0]}") ;;
+            remaining) SEL=("${ALL[@]:1}") ;;
+            all)       SEL=("${ALL[@]}") ;;
+          esac
+          [[ ${#SEL[@]} -gt 0 ]] || { echo "::error::Scope '$HOST_SCOPE' selects no hosts (role has ${#ALL[@]} host)"; exit 1; }
+          printf '%s\n' "${SEL[@]}" > "$RUNNER_TEMP/hosts.txt"
+          echo "Hosts selected (${#SEL[@]} of ${#ALL[@]}):"; sed 's/^/  - /' "$RUNNER_TEMP/hosts.txt"
+
+      - name: Download verified Tomcat archive
+        if: inputs.mode != 'rollback'
+        uses: actions/download-artifact@v4
+        with:
+          name: tomcat-archive
+          path: dist
+
+      - name: Run rollout
+        env:
+          MODE: ${{ inputs.mode }}
+          ROLE: ${{ inputs.role }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          TARGET_VERSION: ${{ inputs.target_version }}
+          SOURCE_VERSION: ${{ inputs.source_version }}
+          AUTO_ROLLBACK: ${{ inputs.auto_rollback }}
+          ALLOW_FORCE_KILL: ${{ inputs.allow_force_kill }}
+          HEALTH_BASE_URL: ${{ inputs.health_base_url }}
+          HEALTH_TIMEOUT: ${{ inputs.health_timeout_seconds }}
+          CHANGE_TICKET: ${{ inputs.change_ticket }}
+          HOSTS_FILE: ${{ runner.temp }}/hosts.txt
+        run: bash scripts/run-rollout.sh
+
+      - name: Remove SSH material
+        if: always()
+        run: |
+          [[ -n "${SSH_AGENT_PID:-}" ]] && kill "$SSH_AGENT_PID" 2>/dev/null || true
+          rm -rf ~/.ssh/id_rsa-atb-svc ~/.ssh/id_rsa-atb-svc.pub ~/.ssh/id_rsa-atb-svc-cert.pub ~/.ssh/askpass.sh

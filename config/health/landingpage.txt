@@ -1,0 +1,3 @@
+# PLACEHOLDER - confirm real endpoints on dev.
+/                    200,302,401
+/landing-page-rest/  200,401,403

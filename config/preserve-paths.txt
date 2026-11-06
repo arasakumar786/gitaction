@@ -1,0 +1,6 @@
+# Paths (relative to the Tomcat directory) copied from the OLD install into the NEW one.
+# One per line. Use this for hand-edited files inside exploded webapps that a fresh unpack would not contain.
+#
+# The existing Ansible playbook (tomcat_copy_files.yml) copied this file for the REST app.
+# VERIFY on dev that it is still needed before keeping it enabled.
+webapps/rest/WEB-INF/classes/environment.properties

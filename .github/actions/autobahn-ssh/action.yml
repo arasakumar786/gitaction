@@ -1,0 +1,169 @@
+name: Autobahn SSH login
+description: >
+  Same server login flow as bpom-deploy.yml. Reads host list and SSH material from Vault
+  (GitHub OIDC/JWT), loads the passphrase-protected key into ssh-agent, and ensures a valid
+  Vault-signed SSH certificate for the Autobahn jump host.
+
+inputs:
+  environment:
+    description: Deployment environment (dev, qa, qa2, staging, prod-ch, prod-ho)
+    required: true
+  host-key:
+    description: Vault field holding the comma separated host list (for example APP_SSH_HOST)
+    required: true
+  vault-url:
+    description: Vault address
+    required: false
+    default: https://xsm-vault.sm.comcast.com
+  vault-role:
+    description: Vault JWT role bound to this repository
+    required: false
+    default: comcast-bpom_ghactions
+  cache-cert-in-vault:
+    description: Write a freshly signed certificate back to deploy/common (same as bpom-deploy.yml)
+    required: false
+    default: 'true'
+  cert-ttl-seconds:
+    description: Requested certificate TTL (Vault role may cap it)
+    required: false
+    default: '86400'
+
+runs:
+  using: composite
+  steps:
+    - name: Retrieve host list and SSH material from Vault
+      uses: hashicorp/vault-action@v3
+      with:
+        method: jwt
+        path: jwt/ghactions
+        url: ${{ inputs.vault-url }}
+        role: ${{ inputs.vault-role }}
+        exportEnv: true
+        exportToken: true
+        secrets: |
+          kv2/data/comcast-bpom/github-actions/deploy/${{ inputs.environment }} ${{ inputs.host-key }} | BPOMVAULT_SSH_HOST ;
+          kv2/data/comcast-bpom/github-actions/deploy/common SSH_USER                   | BPOMVAULT_SSH_USER ;
+          kv2/data/comcast-bpom/github-actions/deploy/common SSH_PORT                   | BPOMVAULT_SSH_PORT ;
+          kv2/data/comcast-bpom/github-actions/deploy/common SSH_PRIVATE_KEY            | SSH_PRIVATE_KEY ;
+          kv2/data/comcast-bpom/github-actions/deploy/common SSH_PUBLIC_KEY             | SSH_PUBLIC_KEY ;
+          kv2/data/comcast-bpom/github-actions/deploy/common SSH_PRIVATE_KEY_PASSPHRASE | SSH_PRIVATE_KEY_PASSPHRASE ;
+          kv2/data/comcast-bpom/github-actions/deploy/common AUTOBAHN_APP_ROLE_NAME     | AUTOBAHN_APP_ROLE_NAME ;
+          kv2/data/comcast-bpom/github-actions/deploy/common AUTOBAHN_SSH_ROLE_NAME     | AUTOBAHN_SSH_ROLE_NAME ;
+          kv2/data/comcast-bpom/github-actions/deploy/common AUTOBAHN_ROLE_ID           | AUTOBAHN_ROLE_ID ;
+          kv2/data/comcast-bpom/github-actions/deploy/common SSH_CERTIFICATE            | SSH_CERTIFICATE
+
+    - name: Verify Vault values
+      shell: bash
+      run: |
+        set -euo pipefail
+        for v in BPOMVAULT_SSH_HOST BPOMVAULT_SSH_USER SSH_PRIVATE_KEY SSH_PUBLIC_KEY \
+                 SSH_PRIVATE_KEY_PASSPHRASE AUTOBAHN_APP_ROLE_NAME AUTOBAHN_SSH_ROLE_NAME AUTOBAHN_ROLE_ID; do
+          [[ -n "${!v:-}" ]] || { echo "::error::$v is empty. Check the Vault path for environment '${{ inputs.environment }}'."; exit 1; }
+        done
+        echo "Vault values present. Hosts configured: $(tr ',' '\n' <<< "$BPOMVAULT_SSH_HOST" | grep -c .)"
+
+    - name: Load key into ssh-agent
+      shell: bash
+      run: |
+        set -euo pipefail
+        umask 077
+        mkdir -p ~/.ssh && chmod 700 ~/.ssh
+        normalized_key="${SSH_PRIVATE_KEY//\\n/$'\n'}"
+        printf '%s\n' "$normalized_key" | tr -d '\r' > ~/.ssh/id_rsa-atb-svc
+        normalized_pub="${SSH_PUBLIC_KEY//\\n/$'\n'}"
+        printf '%s\n' "$normalized_pub" | tr -d '\r' > ~/.ssh/id_rsa-atb-svc.pub
+        chmod 600 ~/.ssh/id_rsa-atb-svc
+        chmod 644 ~/.ssh/id_rsa-atb-svc.pub
+
+        eval "$(ssh-agent -s)" > /dev/null
+        echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+        echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+
+        printf '#!/bin/sh\nprintf "%%s\\n" "$SSH_PRIVATE_KEY_PASSPHRASE"\n' > ~/.ssh/askpass.sh
+        chmod 700 ~/.ssh/askpass.sh
+        if ! SSH_ASKPASS=~/.ssh/askpass.sh SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
+             ssh-add ~/.ssh/id_rsa-atb-svc < /dev/null > /dev/null 2>&1; then
+          rm -f ~/.ssh/askpass.sh
+          echo "::error::Could not add the private key to ssh-agent. Check SSH_PRIVATE_KEY and SSH_PRIVATE_KEY_PASSPHRASE in Vault."
+          exit 1
+        fi
+        rm -f ~/.ssh/askpass.sh
+        ssh-add -l
+
+    - name: Ensure a valid Vault-signed SSH certificate
+      shell: bash
+      env:
+        VAULT_ADDR_IN: ${{ inputs.vault-url }}
+        CACHE_CERT: ${{ inputs.cache-cert-in-vault }}
+        CERT_TTL: ${{ inputs.cert-ttl-seconds }}
+      run: |
+        set -euo pipefail
+        CERT_FILE="$HOME/.ssh/id_rsa-atb-svc-cert.pub"
+        NEED_NEW=true
+
+        if [[ -n "${SSH_CERTIFICATE:-}" ]]; then
+          printf '%s\n' "$SSH_CERTIFICATE" | tr -d '\r' | tr -d '\n' > "$CERT_FILE"; echo >> "$CERT_FILE"
+          chmod 600 "$CERT_FILE"
+          if ssh-keygen -Lf "$CERT_FILE" 2>/dev/null | grep -q "Valid:"; then
+            VALID_UNTIL=$(ssh-keygen -Lf "$CERT_FILE" | grep "Valid:" | sed 's/.*to //')
+            UNTIL_EPOCH=$(date -d "$VALID_UNTIL" +%s 2>/dev/null || echo 0)
+            # Reuse only if it stays valid for at least 3 more hours (same rule as bpom-deploy.yml)
+            if [[ $UNTIL_EPOCH -gt $(( $(date +%s) + 10800 )) ]]; then
+              echo "Cached certificate valid until $VALID_UNTIL - reusing."
+              NEED_NEW=false
+            fi
+          fi
+        fi
+
+        if [[ "$NEED_NEW" == "true" ]]; then
+          echo "Requesting a new certificate from Vault (AppRole -> ssh/sign)."
+          SECRET_RESP=$(curl -s -w '\nHTTP_CODE:%{http_code}' -X POST \
+            -H "X-Vault-Token: $VAULT_TOKEN" \
+            "$VAULT_ADDR_IN/v1/auth/approle/role/$AUTOBAHN_APP_ROLE_NAME/secret-id")
+          [[ "$(grep HTTP_CODE: <<< "$SECRET_RESP" | cut -d: -f2)" == "200" ]] \
+            || { echo "::error::Could not obtain AppRole secret-id (check Vault policy for this repository's role)."; exit 1; }
+          SECRET_ID=$(sed '/HTTP_CODE:/d' <<< "$SECRET_RESP" | jq -r '.data.secret_id // empty')
+          echo "::add-mask::$SECRET_ID"
+
+          LOGIN_RESP=$(curl -s -w '\nHTTP_CODE:%{http_code}' -X POST -H 'Content-Type: application/json' \
+            -d "{\"role_id\":\"$AUTOBAHN_ROLE_ID\",\"secret_id\":\"$SECRET_ID\"}" \
+            "$VAULT_ADDR_IN/v1/auth/approle/login")
+          [[ "$(grep HTTP_CODE: <<< "$LOGIN_RESP" | cut -d: -f2)" == "200" ]] \
+            || { echo "::error::AppRole login failed."; exit 1; }
+          APPROLE_TOKEN=$(sed '/HTTP_CODE:/d' <<< "$LOGIN_RESP" | jq -r '.auth.client_token // empty')
+          echo "::add-mask::$APPROLE_TOKEN"
+
+          PUBLIC_KEY=$(tr -d '\n' <<< "${SSH_PUBLIC_KEY//\\n/$'\n'}")
+          SIGN_RESP=$(curl -s -w '\nHTTP_CODE:%{http_code}' -X POST \
+            -H "X-Vault-Token: $APPROLE_TOKEN" -H 'Content-Type: application/json' \
+            -d "{\"public_key\":\"$PUBLIC_KEY\",\"ttl\":\"$CERT_TTL\"}" \
+            "$VAULT_ADDR_IN/v1/ssh/sign/$AUTOBAHN_SSH_ROLE_NAME")
+          [[ "$(grep HTTP_CODE: <<< "$SIGN_RESP" | cut -d: -f2)" == "200" ]] \
+            || { echo "::error::Vault refused to sign the SSH certificate (check ssh/sign policy)."; exit 1; }
+          SIGNED_KEY=$(sed '/HTTP_CODE:/d' <<< "$SIGN_RESP" | jq -r '.data.signed_key // empty')
+          [[ -n "$SIGNED_KEY" ]] || { echo "::error::Vault returned no signed_key."; exit 1; }
+
+          printf '%s' "$SIGNED_KEY" | tr -d '\n' > "$CERT_FILE"; echo >> "$CERT_FILE"
+          chmod 600 "$CERT_FILE"
+
+          if [[ "$CACHE_CERT" == "true" ]]; then
+            EXISTING=$(curl -s -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR_IN/v1/kv2/data/comcast-bpom/github-actions/deploy/common")
+            PAYLOAD=$(jq --arg cert "$SIGNED_KEY" '(.data.data // {}) + {SSH_CERTIFICATE: $cert} | {data: .}' <<< "$EXISTING")
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "X-Vault-Token: $VAULT_TOKEN" \
+              -H 'Content-Type: application/json' -d "$PAYLOAD" \
+              "$VAULT_ADDR_IN/v1/kv2/data/comcast-bpom/github-actions/deploy/common")
+            [[ "$CODE" == "200" || "$CODE" == "204" ]] \
+              && echo "Certificate cached in Vault." \
+              || echo "::warning::Could not cache the certificate in Vault (HTTP $CODE). Continuing with the local copy."
+          fi
+        fi
+
+        ssh-keygen -Lf "$CERT_FILE" > /dev/null || { echo "::error::SSH certificate is invalid."; exit 1; }
+        echo "SSH certificate ready."
+
+    - name: Trust the jump host
+      shell: bash
+      run: |
+        set -euo pipefail
+        touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
+        ssh-keyscan -H jump.autobahn.comcast.com >> ~/.ssh/known_hosts 2>/dev/null || true
